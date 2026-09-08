@@ -67,8 +67,19 @@ impl WsStream {
 
         let pump_task = tokio::spawn(async move {
             let mut inner = inner;
+            let mut heartbeat = tokio::time::interval_at(
+                Instant::now() + WS_HEARTBEAT_INTERVAL,
+                WS_HEARTBEAT_INTERVAL,
+            );
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if let Err(err) = inner.send(Message::Ping(Default::default())).await {
+                            let _ = tx_message.send(Err(err));
+                            break;
+                        }
+                    }
                     command = rx_command.recv() => {
                         let Some(command) = command else {
                             break;
@@ -90,12 +101,20 @@ impl WsStream {
                         };
                         match message {
                             Ok(Message::Ping(payload)) => {
+                                let activity = Message::Ping(payload.clone());
                                 if let Err(err) = inner.send(Message::Pong(payload)).await {
                                     let _ = tx_message.send(Err(err));
                                     break;
                                 }
+                                if tx_message.send(Ok(activity)).is_err() {
+                                    break;
+                                }
                             }
-                            Ok(Message::Pong(_)) => {}
+                            Ok(message @ Message::Pong(_)) => {
+                                if tx_message.send(Ok(message)).is_err() {
+                                    break;
+                                }
+                            }
                             Ok(message @ (Message::Text(_)
                             | Message::Binary(_)
                             | Message::Close(_)
@@ -152,6 +171,7 @@ impl Drop for WsStream {
     }
 }
 
+const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const X_MODELS_ETAG_HEADER: &str = "x-models-etag";
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";

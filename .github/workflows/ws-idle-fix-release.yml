@@ -5,64 +5,24 @@ on:
     branches:
       - main
     paths:
+      - codex-rs/codex-api/src/endpoint/responses_websocket.rs
       - .github/workflows/ws-idle-fix-release.yml
-      - .github/scripts/apply-ws-idle-fix.py
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  prepare:
-    name: Prepare patched source
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      sha: ${{ steps.commit.outputs.sha }}
-
-    steps:
-      - name: Check out fork
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-
-      - name: Apply WebSocket liveness patch
-        run: |
-          set -euo pipefail
-          python .github/scripts/apply-ws-idle-fix.py
-          git diff --check
-          git diff -- codex-rs/codex-api/src/endpoint/responses_websocket.rs
-
-      - name: Commit patch to fork
-        id: commit
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- codex-rs/codex-api/src/endpoint/responses_websocket.rs; then
-            sha="$(git rev-parse HEAD)"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add codex-rs/codex-api/src/endpoint/responses_websocket.rs
-            git commit \
-              -m "Fix false Responses WebSocket idle timeout" \
-              -m $'Send periodic WebSocket pings and forward Ping/Pong transport activity to the response waiter so long reasoning silence does not look like a dead stream.\n\nBased on openai/codex#39771.'
-            git push origin HEAD:main
-            sha="$(git rev-parse HEAD)"
-          fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Patched source commit: $sha"
-
   linux-x64:
     name: Build Linux x64
-    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
-      - name: Check out patched source
+      - name: Check out committed source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ needs.prepare.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Install Linux build dependencies
@@ -84,12 +44,11 @@ jobs:
         with:
           target: x86_64-unknown-linux-gnu
 
-      - name: Build patched Codex
+      - name: Build Codex
         working-directory: codex-rs
         run: |
           set -euo pipefail
-          STABLE_GIT_COMMIT="${{ needs.prepare.outputs.sha }}"
-          export STABLE_GIT_COMMIT
+          export STABLE_GIT_COMMIT="${{ github.sha }}"
           cargo build --target x86_64-unknown-linux-gnu --release --bin codex
 
       - name: Stage Linux artifact
@@ -99,7 +58,10 @@ jobs:
           test -f "$source"
           mkdir -p dist-linux
           cp "$source" dist-linux/codex
+          chmod +x dist-linux/codex
           sha256sum dist-linux/codex > dist-linux/codex.sha256
+          file dist-linux/codex
+          ./dist-linux/codex --version
           cat dist-linux/codex.sha256
 
       - name: Upload Linux x64 artifact
@@ -113,17 +75,15 @@ jobs:
 
   windows-x64:
     name: Build Windows x64
-    needs:
-      - prepare
-      - linux-x64
+    needs: linux-x64
     runs-on: windows-latest
     timeout-minutes: 90
 
     steps:
-      - name: Check out patched source
+      - name: Check out committed source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ needs.prepare.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -141,14 +101,13 @@ jobs:
         with:
           target: x86_64-pc-windows-msvc
 
-      - name: Build patched Codex
+      - name: Build Codex
         shell: bash
         working-directory: codex-rs
         run: |
           set -euo pipefail
           export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
-          STABLE_GIT_COMMIT="${{ needs.prepare.outputs.sha }}"
-          export STABLE_GIT_COMMIT
+          export STABLE_GIT_COMMIT="${{ github.sha }}"
           cargo build --target x86_64-pc-windows-msvc --release --bin codex
 
       - name: Stage Windows artifact
@@ -180,7 +139,6 @@ jobs:
   release:
     name: Create GitHub release
     needs:
-      - prepare
       - linux-x64
       - windows-x64
     runs-on: ubuntu-latest
@@ -214,11 +172,11 @@ jobs:
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          PATCH_SHA: ${{ needs.prepare.outputs.sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          short="${PATCH_SHA:0:12}"
+          short="${SOURCE_SHA:0:12}"
           tag="ws-idle-fix-$short"
           title="Codex Linux/Windows x64 - WebSocket idle-timeout fix ($short)"
 
@@ -226,14 +184,14 @@ jobs:
           windows_sha="$(awk '{print $1}' release-assets/windows/codex.exe.sha256)"
 
           cat > release-notes.md <<EOF
-          Unofficial Linux x64 and Windows x64 builds of Codex from this fork with the false Responses WebSocket idle-timeout workaround based on openai/codex#39771.
+          Unofficial Linux x64 and Windows x64 builds of Codex from this fork with the false Responses WebSocket idle-timeout fix based on openai/codex#39771.
 
           Patch behavior:
           - sends a WebSocket Ping every 20 seconds;
           - forwards received Ping/Pong frames to the response waiter as transport activity;
-          - the response loop already ignores Ping/Pong, so transport liveness resets the existing idle watchdog without fabricating Responses API events.
+          - the response loop ignores Ping/Pong, so transport liveness resets the existing idle watchdog without fabricating Responses API events.
 
-          Commit: $PATCH_SHA
+          Commit: $SOURCE_SHA
           Linux x64 codex SHA-256: $linux_sha
           Windows x64 codex.exe SHA-256: $windows_sha
           EOF
@@ -241,13 +199,13 @@ jobs:
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$tag" \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$PATCH_SHA" \
+              --target "$SOURCE_SHA" \
               --title "$title" \
               --notes-file release-notes.md
           else
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$PATCH_SHA" \
+              --target "$SOURCE_SHA" \
               --title "$title" \
               --notes-file release-notes.md
           fi

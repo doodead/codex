@@ -1,5 +1,6 @@
 from pathlib import Path
 
+# This script exists only to apply the source patch once; builds should consume the committed source.
 path = Path("codex-rs/codex-api/src/endpoint/responses_websocket.rs")
 text = path.read_text(encoding="utf-8")
 

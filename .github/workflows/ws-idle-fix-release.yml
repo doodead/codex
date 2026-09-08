@@ -6,15 +6,19 @@ on:
       - main
     paths:
       - .github/workflows/ws-idle-fix-release.yml
+      - .github/scripts/apply-ws-idle-fix.py
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  patch-build-release:
-    runs-on: windows-latest
-    timeout-minutes: 90
+  prepare:
+    name: Prepare patched source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
 
     steps:
       - name: Check out fork
@@ -23,104 +27,104 @@ jobs:
           fetch-depth: 0
 
       - name: Apply WebSocket liveness patch
-        shell: pwsh
         run: |
-          @'
-          from pathlib import Path
-
-          path = Path("codex-rs/codex-api/src/endpoint/responses_websocket.rs")
-          text = path.read_text(encoding="utf-8")
-
-          marker = "const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);"
-          if marker in text:
-              print("WebSocket liveness patch is already applied.")
-              raise SystemExit(0)
-
-          old = '''        let pump_task = tokio::spawn(async move {
-              let mut inner = inner;
-              loop {
-                  tokio::select! {
-                      command = rx_command.recv() => {
-          '''
-          new = '''        let pump_task = tokio::spawn(async move {
-              let mut inner = inner;
-              let mut heartbeat = tokio::time::interval_at(
-                  Instant::now() + WS_HEARTBEAT_INTERVAL,
-                  WS_HEARTBEAT_INTERVAL,
-              );
-              heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-              loop {
-                  tokio::select! {
-                      _ = heartbeat.tick() => {
-                          if let Err(err) = inner.send(Message::Ping(Default::default())).await {
-                              let _ = tx_message.send(Err(err));
-                              break;
-                          }
-                      }
-                      command = rx_command.recv() => {
-          '''
-          if old not in text:
-              raise SystemExit("Could not locate WsStream pump insertion point; upstream changed.")
-          text = text.replace(old, new, 1)
-
-          old = '''                            Ok(Message::Ping(payload)) => {
-                                  if let Err(err) = inner.send(Message::Pong(payload)).await {
-                                      let _ = tx_message.send(Err(err));
-                                      break;
-                                  }
-                              }
-                              Ok(Message::Pong(_)) => {}
-          '''
-          new = '''                            Ok(Message::Ping(payload)) => {
-                                  let activity = Message::Ping(payload.clone());
-                                  if let Err(err) = inner.send(Message::Pong(payload)).await {
-                                      let _ = tx_message.send(Err(err));
-                                      break;
-                                  }
-                                  if tx_message.send(Ok(activity)).is_err() {
-                                      break;
-                                  }
-                              }
-                              Ok(message @ Message::Pong(_)) => {
-                                  if tx_message.send(Ok(message)).is_err() {
-                                      break;
-                                  }
-                              }
-          '''
-          if old not in text:
-              raise SystemExit("Could not locate Ping/Pong handling; upstream changed.")
-          text = text.replace(old, new, 1)
-
-          old = '''const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
-          '''
-          new = '''const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
-          const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
-          '''
-          if old not in text:
-              raise SystemExit("Could not locate WebSocket constants; upstream changed.")
-          text = text.replace(old, new, 1)
-
-          path.write_text(text, encoding="utf-8", newline="\n")
-          '@ | python -
-
+          set -euo pipefail
+          python .github/scripts/apply-ws-idle-fix.py
           git diff --check
           git diff -- codex-rs/codex-api/src/endpoint/responses_websocket.rs
 
       - name: Commit patch to fork
         id: commit
-        shell: pwsh
         run: |
-          if (-not (git status --porcelain -- codex-rs/codex-api/src/endpoint/responses_websocket.rs)) {
-            "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
-            exit 0
-          }
+          set -euo pipefail
+          if git diff --quiet -- codex-rs/codex-api/src/endpoint/responses_websocket.rs; then
+            sha="$(git rev-parse HEAD)"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add codex-rs/codex-api/src/endpoint/responses_websocket.rs
+            git commit \
+              -m "Fix false Responses WebSocket idle timeout" \
+              -m $'Send periodic WebSocket pings and forward Ping/Pong transport activity to the response waiter so long reasoning silence does not look like a dead stream.\n\nBased on openai/codex#39771.'
+            git push origin HEAD:main
+            sha="$(git rev-parse HEAD)"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Patched source commit: $sha"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add codex-rs/codex-api/src/endpoint/responses_websocket.rs
-          git commit -m "Fix false Responses WebSocket idle timeout" -m "Send periodic WebSocket pings and forward Ping/Pong transport activity to the response waiter so long reasoning silence does not look like a dead stream.\n\nBased on openai/codex#39771."
-          git push origin HEAD:main
-          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+  linux-x64:
+    name: Build Linux x64
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out patched source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config \
+            libcap-dev \
+            libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Configure rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Build patched Codex
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          STABLE_GIT_COMMIT="${{ needs.prepare.outputs.sha }}"
+          export STABLE_GIT_COMMIT
+          cargo build --target x86_64-unknown-linux-gnu --release --bin codex
+
+      - name: Stage Linux artifact
+        run: |
+          set -euo pipefail
+          source="codex-rs/target/x86_64-unknown-linux-gnu/release/codex"
+          test -f "$source"
+          mkdir -p dist-linux
+          cp "$source" dist-linux/codex
+          sha256sum dist-linux/codex > dist-linux/codex.sha256
+          cat dist-linux/codex.sha256
+
+      - name: Upload Linux x64 artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-linux-x64-ws-idle-fix
+          path: |
+            dist-linux/codex
+            dist-linux/codex.sha256
+          if-no-files-found: error
+
+  windows-x64:
+    name: Build Windows x64
+    needs:
+      - prepare
+      - linux-x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out patched source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -143,56 +147,115 @@ jobs:
         run: |
           set -euo pipefail
           export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          STABLE_GIT_COMMIT="${{ needs.prepare.outputs.sha }}"
+          export STABLE_GIT_COMMIT
           cargo build --target x86_64-pc-windows-msvc --release --bin codex
 
-      - name: Stage release binary
-        id: stage
+      - name: Stage Windows artifact
         shell: pwsh
         run: |
           $source = "codex-rs/target/x86_64-pc-windows-msvc/release/codex.exe"
-          if (-not (Test-Path $source)) {
+          if (-not (Test-Path -LiteralPath $source)) {
             throw "Built codex.exe not found at $source"
           }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item $source dist/codex.exe
-          $hash = (Get-FileHash dist/codex.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -NoNewline dist/codex.exe.sha256 "$hash  codex.exe"
-          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Force -Path dist-windows | Out-Null
+          Copy-Item -LiteralPath $source -Destination dist-windows/codex.exe
+          $hash = (Get-FileHash -LiteralPath dist-windows/codex.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            (Join-Path $PWD "dist-windows/codex.exe.sha256"),
+            "$hash  codex.exe`n",
+            [Text.Encoding]::ASCII
+          )
+          Get-Content -LiteralPath dist-windows/codex.exe.sha256
 
-      - name: Upload workflow artifact
+      - name: Upload Windows x64 artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-windows-x64-ws-idle-fix
           path: |
-            dist/codex.exe
-            dist/codex.exe.sha256
+            dist-windows/codex.exe
+            dist-windows/codex.exe.sha256
           if-no-files-found: error
 
-      - name: Create GitHub release
-        shell: pwsh
+  release:
+    name: Create GitHub release
+    needs:
+      - prepare
+      - linux-x64
+      - windows-x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-linux-x64-ws-idle-fix
+          path: release-assets/linux
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-windows-x64-ws-idle-fix
+          path: release-assets/windows
+
+      - name: Validate release assets
+        run: |
+          set -euo pipefail
+          test -f release-assets/linux/codex
+          test -f release-assets/linux/codex.sha256
+          test -f release-assets/windows/codex.exe
+          test -f release-assets/windows/codex.exe.sha256
+          echo "Linux:"
+          cat release-assets/linux/codex.sha256
+          echo "Windows:"
+          cat release-assets/windows/codex.exe.sha256
+
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          PATCH_SHA: ${{ steps.commit.outputs.sha }}
-          EXE_SHA256: ${{ steps.stage.outputs.sha256 }}
+          PATCH_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
-          $short = $env:PATCH_SHA.Substring(0, 12)
-          $tag = "ws-idle-fix-$short"
-          $title = "Codex Windows x64 - WebSocket idle-timeout fix ($short)"
-          $notes = @"
-          Unofficial Windows x64 build of Codex from this fork with the false Responses WebSocket idle-timeout workaround based on openai/codex#39771.
+          set -euo pipefail
+
+          short="${PATCH_SHA:0:12}"
+          tag="ws-idle-fix-$short"
+          title="Codex Linux/Windows x64 - WebSocket idle-timeout fix ($short)"
+
+          linux_sha="$(awk '{print $1}' release-assets/linux/codex.sha256)"
+          windows_sha="$(awk '{print $1}' release-assets/windows/codex.exe.sha256)"
+
+          cat > release-notes.md <<EOF
+          Unofficial Linux x64 and Windows x64 builds of Codex from this fork with the false Responses WebSocket idle-timeout workaround based on openai/codex#39771.
 
           Patch behavior:
           - sends a WebSocket Ping every 20 seconds;
           - forwards received Ping/Pong frames to the response waiter as transport activity;
           - the response loop already ignores Ping/Pong, so transport liveness resets the existing idle watchdog without fabricating Responses API events.
 
-          Commit: $env:PATCH_SHA
-          codex.exe SHA-256: $env:EXE_SHA256
-          "@
+          Commit: $PATCH_SHA
+          Linux x64 codex SHA-256: $linux_sha
+          Windows x64 codex.exe SHA-256: $windows_sha
+          EOF
 
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag dist/codex.exe dist/codex.exe.sha256 --clobber --repo $env:GITHUB_REPOSITORY
-          } else {
-            gh release create $tag dist/codex.exe dist/codex.exe.sha256 --repo $env:GITHUB_REPOSITORY --target $env:PATCH_SHA --title $title --notes $notes
-          }
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$PATCH_SHA" \
+              --title "$title" \
+              --notes-file release-notes.md
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$PATCH_SHA" \
+              --title "$title" \
+              --notes-file release-notes.md
+          fi
+
+          gh release upload "$tag" \
+            release-assets/linux/codex \
+            release-assets/linux/codex.sha256 \
+            release-assets/windows/codex.exe \
+            release-assets/windows/codex.exe.sha256 \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
